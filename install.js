@@ -1,0 +1,429 @@
+// `wfdash install` — put the skill where every agent on this machine will find it.
+//
+// The research (`docs/research/agent-skill-loading.md`) turned "write 24 vendor paths" into
+// a much smaller question: **`~/.agents/skills/` is read by 16 of the 24 confirmed products**,
+// and the exception list is eight roots, not twenty-four. `.claude/skills/` is a
+// compatibility alias, not the convention.
+//
+// Three rules the research fixed, which the code below is shaped by:
+//
+//   - **User level only.** Precedence runs in opposite directions — project beats user in
+//     Kiro, OpenHands, Junie, Trae, Factory and Zed, but user beats project in Amp and
+//     Cline, and Junie resolves the collision by skipping the user-level skill entirely.
+//     An installer that writes both levels behaves differently on Amp than on everything
+//     else, so it writes one.
+//   - **Detect, never prompt.** An agent running this unattended would hang forever.
+//   - **No launcher.** `wfdash.mjs` exists for the Claude Code plugin, where `bin/` is two
+//     levels up; copied anywhere else its import resolves to nothing, and anywhere else
+//     `wfdash` is on PATH by construction. This is a rule about a *file that resolves a
+//     specifier*, not a file count — see `SKILLS`.
+
+import { mkdir, readFile, writeFile, readdir, lstat, readlink } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+
+/** The shared root, and the reason this installer is eight rows rather than twenty-four. */
+export const SHARED_ROOT = '.agents/skills';
+
+/**
+ * The agents that read the shared root, each with the directory that proves it is on this
+ * machine. Their presence is what makes writing `~/.agents/skills/` worth doing; none of
+ * them needs a path of its own.
+ *
+ * Devin is the sixteenth reader and is deliberately absent: it is repository-only, with no
+ * user-level path at all, so a user-level installer cannot reach it.
+ */
+export const SHARED_READERS = [
+  ['Codex CLI', '.codex'],
+  ['Cursor', '.cursor'],
+  ['Gemini CLI', '.gemini'],
+  ['GitHub Copilot', '.copilot'],
+  ['Amp', '.config/amp'],
+  ['Goose', '.config/goose'],
+  ['OpenHands', '.openhands'],
+  ['opencode', '.config/opencode'],
+  ['Charm Crush', '.config/crush'],
+  ['Zed', '.config/zed'],
+  ['Warp', '.warp'],
+  ['Cline', '.cline'],
+  ['Augment Code', '.augment'],
+  ['OpenClaw', '.openclaw'],
+  ['Factory Droid', '.factory'],
+];
+
+/**
+ * The agents that read only a vendor-private path. **This is the list that rots** — not the
+ * whole table — and it is eight rows, because paths in this ecosystem are added rather than
+ * moved. A row here going stale means one agent misses an update, not that the installer
+ * breaks.
+ */
+export const VENDOR_ONLY = [
+  ['Claude Code', '.claude', '.claude/skills'],
+  ['Continue.dev', '.continue', '.continue/skills'],
+  ['Windsurf', '.codeium/windsurf', '.codeium/windsurf/skills'],
+  ['Qwen Code', '.qwen', '.qwen/skills'],
+  ['Kiro', '.kiro', '.kiro/skills'],
+  ['JetBrains Junie', '.junie', '.junie/skills'],
+  ['Trae', '.trae', '.trae/skills'],
+  // Kilo Code answers to two spellings of its own config directory, so it gets a row each;
+  // a machine with both gets both, which is what Kilo itself reads.
+  ['Kilo Code', '.kilo', '.kilo/skills'],
+  ['Kilo Code', '.kilocode', '.kilocode/skills'],
+];
+
+export const slugOf = (name) => name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+
+/** Every root this installer ever writes to — and so every place a copy of it can be found. */
+export const ROOTS = [SHARED_ROOT, ...VENDOR_ONLY.map(([, , root]) => root)];
+
+/** Every agent this installer knows how to reach, in report order. */
+export function agents() {
+  return [
+    { name: 'every agent reading the shared root', slug: 'shared', root: SHARED_ROOT, shared: true },
+    ...VENDOR_ONLY.map(([name, probe, root]) => ({ name, slug: slugOf(name), probe, root, shared: false })),
+  ];
+}
+
+// ------------------------------------------------------------------ the source
+
+/**
+ * **The two skills this installer writes**, in report order.
+ *
+ * `wfdash` is the dashboard. `wf-charting` is the charting rules — the same bytes the
+ * `wayfinder-tools` plugin's hooks inject on a `/wayfinder` session in Claude Code, carried
+ * as a skill everywhere hooks do not run. That is *every agent this installer exists for*,
+ * so shipping only the first is the exact gap `wf-charting` was created to close, reopened
+ * at the delivery step.
+ *
+ * `wf-charting` is the one skill that is **two files**: its `SKILL.md` is a pointer, and
+ * `charting.md` beside it is the rules. That does not reopen "the installer writes
+ * `SKILL.md` and nothing else" — that rule is about `wfdash.mjs`, a *launcher* whose
+ * `../bin` import resolves to nothing outside the plugin. `charting.md` imports nothing and
+ * resolves nothing; it is inert markdown named by a relative path that is correct wherever
+ * the pair is written together. The rule's reason does not reach it.
+ *
+ * The pair stays **flat** — two siblings, no subdirectory — because Zed and Continue
+ * discover immediate subdirectories of the skills root only, and a nested file would put
+ * the rules where they cannot see them.
+ */
+export const SKILLS = [
+  { name: 'wfdash', extra: [] },
+  { name: 'wf-charting', extra: ['charting.md'] },
+];
+
+/**
+ * Where each file comes from, most-published first.
+ *
+ * In the released package the tree is the plugin's, so `wfdash` sits at `skills/wfdash/` and
+ * `wf-charting` at `wf-charting/` beside it. In this checkout neither exists yet: the
+ * authored `SKILL.md`s are under `publish/`, and `charting.md` is the single authored copy
+ * at `charting/charting.md` that the release fans out. Falling through to those is
+ * deliberate — a development install writes exactly the bytes a release would, so the test
+ * seam exercises the real files rather than stand-ins.
+ */
+const SOURCES = {
+  wfdash: {
+    'SKILL.md': ['skills/wfdash/SKILL.md', 'publish/plugins/wayfinder-tools/skills/wfdash/SKILL.md'],
+  },
+  'wf-charting': {
+    'SKILL.md': ['wf-charting/SKILL.md', 'publish/wf-charting/SKILL.md'],
+    'charting.md': ['wf-charting/charting.md', 'charting/charting.md'],
+  },
+};
+const MANIFESTS = ['package.json', 'publish/plugins/wayfinder-tools/package.json'];
+
+const firstExisting = (candidates) => {
+  for (const c of candidates) {
+    const path = join(HERE, c);
+    if (existsSync(path)) return path;
+  }
+  return null;
+};
+
+/** The version this copy of wfdash was cut at — the number the stamp carries. */
+export async function version() {
+  for (const rel of MANIFESTS) {
+    const path = join(HERE, rel);
+    if (!existsSync(path)) continue;
+    const { version } = JSON.parse(await readFile(path, 'utf8'));
+    if (version) return version;
+  }
+  return '0.0.0-dev';
+}
+
+/**
+ * The stamp, and the whole of what makes an installed copy identifiable.
+ *
+ * It is an **HTML comment on the last line of the body**, not a frontmatter key. Frontmatter
+ * is the one part of a `SKILL.md` that agents parse strictly and disagree about: the spec's
+ * validator rejects unknown keys outright, and adding a `version:` would fail it. A comment
+ * is inert in every parser, invisible in every renderer, and greppable in one line.
+ */
+export const STAMP = /^<!-- wfdash (\S+) — installed by `wfdash install`/m;
+export const stampFor = (v) => `<!-- wfdash ${v} — installed by \`wfdash install\`; rerun it to update -->`;
+
+/**
+ * A skill as it will be written: `file -> bytes`.
+ *
+ * Only `SKILL.md` is stamped. The stamp is what tells our copy from someone else's and what
+ * the stale check reads, and both of those questions are asked of the skill, not of each of
+ * its files — a second stamp would be a second thing to keep in step for no reader.
+ */
+export async function payload(v, skill) {
+  const out = {};
+  for (const file of ['SKILL.md', ...skill.extra]) {
+    const src = firstExisting(SOURCES[skill.name][file]);
+    if (!src) throw new Error(`no ${skill.name}/${file} beside this installer — nothing to install`);
+    const text = await readFile(src, 'utf8');
+    out[file] = file === 'SKILL.md' ? `${text.trimEnd()}\n\n${stampFor(v)}\n` : text;
+  }
+  return out;
+}
+
+// ------------------------------------------------------------------ Claude Code
+
+/**
+ * Claude Code is skipped when the `wayfinder-tools` plugin is already installed: the plugin
+ * carries this same skill, and a second copy in `~/.claude/skills/` would shadow or
+ * duplicate it. A Claude user *without* the marketplace still gets the skill, which is the
+ * case this rule exists to preserve.
+ */
+export async function claudePluginPresent(home) {
+  const manifest = join(home, '.claude/plugins/installed_plugins.json');
+  if (existsSync(manifest)) {
+    try {
+      const { plugins } = JSON.parse(await readFile(manifest, 'utf8'));
+      if (Object.keys(plugins ?? {}).some((k) => k.split('@')[0] === 'wayfinder-tools')) return true;
+    } catch {
+      /* an unreadable manifest is not evidence of a plugin */
+    }
+  }
+  // The cache is the other half of the same fact, and survives a manifest this code cannot
+  // parse — the format has already changed once (`"version": 2`).
+  const cache = join(home, '.claude/plugins/cache');
+  if (!existsSync(cache)) return false;
+  for (const market of await readdir(cache).catch(() => [])) {
+    if (existsSync(join(cache, market, 'wayfinder-tools'))) return true;
+  }
+  return false;
+}
+
+// ------------------------------------------------------------------ the plan
+
+/**
+ * What to do with each target, decided before anything is written.
+ *
+ * The shared root is written when **an agent that reads it is present**, or when the root
+ * already exists because someone made it deliberately. It is never created speculatively:
+ * on a machine with no such agent it is a directory nothing asked for.
+ */
+export async function plan({ home = homedir(), only = null } = {}) {
+  const has = (rel) => existsSync(join(home, rel));
+  const found = SHARED_READERS.filter(([, probe]) => has(probe)).map(([name]) => name);
+  const pluginPresent = await claudePluginPresent(home);
+
+  return agents().map((agent) => {
+    const forced = only === agent.slug;
+    if (agent.shared) {
+      const reason = has(SHARED_ROOT)
+        ? `${SHARED_ROOT} already exists`
+        : found.length
+          ? `${found.join(', ')} ${found.length === 1 ? 'reads' : 'read'} it`
+          : null;
+      return {
+        ...agent,
+        detail: found.length ? found.join(', ') : 'no agent here reads it',
+        write: forced || reason !== null,
+        skip: reason === null && !forced ? 'no agent on this machine reads the shared root' : null,
+      };
+    }
+    if (agent.name === 'Claude Code' && pluginPresent && !forced) {
+      return { ...agent, detail: agent.name, write: false, skip: 'the wayfinder-tools plugin is already installed' };
+    }
+    return {
+      ...agent,
+      detail: agent.name,
+      write: forced || has(agent.probe),
+      skip: null,
+      absent: !has(agent.probe),
+    };
+  });
+}
+
+// ------------------------------------------------------------------ writing
+
+const rel = (home, path) => (path.startsWith(home) ? `~${path.slice(home.length)}` : path);
+
+/** Where `path` points, if it is a symlink. Never follows it — that is the whole point. */
+const linkTarget = (path) =>
+  lstat(path)
+    .then((s) => (s.isSymbolicLink() ? readlink(path) : null))
+    .catch(() => null);
+
+async function writeOne(home, target, skill, bodies, { force }) {
+  const dir = join(home, target.root, skill.name);
+  const file = join(dir, 'SKILL.md');
+  const where = rel(home, file);
+
+  // **A symlink is refused outright, `--force` included.** `mkdir` and `writeFile` both
+  // follow links, so writing here does not replace the skill — it reaches down the link and
+  // overwrites whatever is on the other end. The common arrangement is a development
+  // install pointing at a checkout, and this repo's own machine has exactly that:
+  // `~/.claude/skills/wfdash` → `…/wfdash/skill`, whose `SKILL.md` is tracked source.
+  //
+  // `--force` means "replace the skill that is here". It has never meant "follow a link out
+  // of the skills directory and overwrite a file somewhere else", so it does not authorise
+  // this. Removing the link is a decision for whoever made it, and the message says so.
+  for (const [path, what] of [[dir, 'directory'], [file, 'SKILL.md']]) {
+    const points = await linkTarget(path);
+    if (points) {
+      return {
+        verb: 'skipped',
+        where,
+        why: `its ${what} is a symlink to ${points} — writing would overwrite that, not the skill; remove the link first`,
+      };
+    }
+  }
+
+  let existing = null;
+  if (existsSync(file)) existing = await readFile(file, 'utf8').catch(() => null);
+
+  // Someone else's skill called `wfdash`. Refusing is the only safe answer: overwriting is
+  // the one failure here that destroys work, and the stamp is what tells the two apart.
+  if (existing !== null && !STAMP.test(existing) && !force) {
+    return { verb: 'skipped', where, why: 'a SKILL.md is there that wfdash did not write; `--force` replaces it' };
+  }
+
+  // `unchanged` is a claim about the whole skill, not about its `SKILL.md`. A stamp that
+  // already matches while `charting.md` beside it is missing or stale is exactly the state
+  // a rerun exists to repair, so every file is compared before the verb is chosen.
+  let same = existing === bodies['SKILL.md'];
+  for (const extra of Object.keys(bodies)) {
+    if (extra === 'SKILL.md' || !same) continue;
+    const at = join(dir, extra);
+    same = existsSync(at) && (await readFile(at, 'utf8').catch(() => null)) === bodies[extra];
+  }
+  if (same) return { verb: 'unchanged', where };
+
+  try {
+    await mkdir(dir, { recursive: true });
+    for (const [name, body] of Object.entries(bodies)) await writeFile(join(dir, name), body);
+  } catch (e) {
+    return { verb: 'failed', where, why: e.code ?? e.message };
+  }
+  return { verb: existing === null ? 'wrote' : 'updated', where };
+}
+
+// ------------------------------------------------------------------ staleness
+
+/**
+ * Every installed copy whose stamp is not `v`.
+ *
+ * **The command does not know where it was installed to** — nothing is written down, here
+ * as everywhere else in wfdash. So it does not remember: it re-derives the same nine roots
+ * it would write to and reads the stamp out of any `SKILL.md` sitting in one. The table is
+ * the single source of truth for both directions, which is the only way the two can't drift.
+ *
+ * Copies with no stamp are silently ignored, and that is load-bearing: the Claude Code
+ * plugin's own `skills/wfdash/SKILL.md` is unstamped because the installer never wrote it,
+ * so a plugin user is never told their skill is stale by the command the plugin ships.
+ */
+export async function staleInstalls({ home = homedir(), v } = {}) {
+  const found = [];
+  for (const root of ROOTS) {
+    for (const skill of SKILLS) {
+      const file = join(home, root, skill.name, 'SKILL.md');
+      if (!existsSync(file)) continue;
+      const stamp = STAMP.exec(await readFile(file, 'utf8').catch(() => ''));
+      if (stamp && stamp[1] !== v) found.push({ where: rel(home, file), version: stamp[1] });
+    }
+  }
+  return found;
+}
+
+/** `a` is an earlier release than `b`. Unparseable either side answers `false` — "differs". */
+export function olderThan(a, b) {
+  const parts = (s) => /^(\d+)\.(\d+)\.(\d+)/.exec(s)?.slice(1, 4).map(Number);
+  const [x, y] = [parts(a), parts(b)];
+  if (!x || !y) return false;
+  for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] < y[i];
+  return false;
+}
+
+// ------------------------------------------------------------------ the report
+
+/** The shared row can name fifteen agents; four and a count is as much as a line can hold. */
+const summarise = (names, keep = 3) =>
+  names.length <= keep + 1 ? names.join(', ') : `${names.slice(0, keep).join(', ')} and ${names.length - keep} more`;
+
+/**
+ * One format, plain text, verb first.
+ *
+ * There is no `--json`. The readers are agents and humans, and an agent reads a verb and a
+ * path as well as it reads a key and a value; a second output format would be a second
+ * thing to keep in step for no reader that exists.
+ */
+export async function install({ home = homedir(), only = null, force = false, all = false, out = console.log } = {}) {
+  const v = await version();
+  const bodies = Object.fromEntries(await Promise.all(SKILLS.map(async (s) => [s.name, await payload(v, s)])));
+  const targets = await plan({ home, only });
+
+  if (only && !targets.some((t) => t.slug === only)) {
+    const names = [...new Set(targets.map((t) => t.slug))].join(', ');
+    out(`wfdash: no agent called ${only} — try one of: ${names}`);
+    return 1;
+  }
+
+  const rows = [];
+  const absent = [];
+  // A target is a place; a row is a skill written to one. They stopped being the same thing
+  // when the second skill arrived, so the header counts targets and the body lists rows.
+  let reached = 0;
+  let considered = 0;
+  for (const target of only ? targets.filter((t) => t.slug === only) : targets) {
+    const detail = target.shared ? summarise(target.detail.split(', ')) : target.detail;
+    if (target.skip) {
+      considered++;
+      rows.push({ verb: 'skipped', where: `~/${target.root}/`, why: target.skip, detail: target.shared ? '' : detail });
+      continue;
+    }
+    if (!target.write) {
+      if (!absent.includes(target.name)) absent.push(target.name);
+      if (all) {
+        considered++;
+        rows.push({ verb: 'absent', where: `~/${target.probe}`, why: 'not on this machine', detail });
+      }
+      continue;
+    }
+    considered++;
+    let here = 0;
+    for (const skill of SKILLS) {
+      const row = { ...(await writeOne(home, target, skill, bodies[skill.name], { force })), detail };
+      if (['wrote', 'updated', 'unchanged'].includes(row.verb)) here++;
+      rows.push(row);
+    }
+    if (here) reached++;
+  }
+
+  const landed = rows.filter((r) => ['wrote', 'updated', 'unchanged'].includes(r.verb));
+  out(`wfdash ${v} — ${landed.length ? `installed into ${reached} of ${considered} target${considered === 1 ? '' : 's'}` : 'installed nowhere'}`);
+  out('');
+  const wid = Math.min(48, Math.max(0, ...rows.map((r) => r.where.length)));
+  for (const r of rows) {
+    const said = r.why ? (r.detail ? `${r.detail} — ${r.why}` : r.why) : r.detail;
+    out(`  ${r.verb.padEnd(9)} ${r.where.padEnd(wid)}  ${said}`.trimEnd());
+  }
+  if (absent.length && !all) {
+    out('');
+    out(`  not on this machine: ${absent.join(', ')}`);
+    out('  `--all` lists them; `--agent <name>` installs into one anyway');
+  }
+
+  // A fan-out: one unwritable vendor directory must not fail the other fifteen. An install
+  // that landed *nowhere* is a different thing, and is a failure.
+  return landed.length ? 0 : 1;
+}

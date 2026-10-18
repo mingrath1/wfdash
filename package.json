@@ -1,0 +1,33 @@
+{
+  "name": "@mingrath/wfdash",
+  "version": "0.1.5",
+  "description": "A local, read-only browser dashboard over your wayfinder maps — plus the charting rules, injected into every /wayfinder session.",
+  "keywords": [
+    "wayfinder",
+    "github-issues",
+    "dashboard",
+    "planning",
+    "agent-skills",
+    "skill"
+  ],
+  "homepage": "https://github.com/mingrath/wfdash#readme",
+  "bugs": {
+    "url": "https://github.com/mingrath/wfdash/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mingrath/wfdash.git"
+  },
+  "license": "MIT",
+  "author": "Mingrath Mekavichai (https://github.com/mingrath)",
+  "type": "module",
+  "bin": {
+    "wfdash": "bin/wfdash.js"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
